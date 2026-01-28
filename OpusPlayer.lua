@@ -8,6 +8,7 @@ local ogg = ffi.load("ogg")
 
 local BLOCK_SIZE = 4096
 local OPUS_BLOCK_SIZE = 5760 
+local bitConvert = 32768.0
 
 ffi.cdef[[
     // Opus decoder
@@ -82,17 +83,13 @@ ffi.cdef[[
 
 local function file_read(self, bytes)
     if self.source_type == "stream" then
-        -- Stream from file handle
         if not self.file then return nil end
-        return self.file:read(bytes)
+        local chunk = self.file:read(bytes)
+        return chunk or false  -- false = EOF
     else
-        -- Read from memory
-        if self.filepos >= #self.filedata then return nil end
-            
-        -- clamp the read end to the end of the file
+        if self.filepos >= #self.filedata then return false end
         local end_pos = math.min(self.filepos + bytes, #self.filedata)
         local chunk = self.filedata:sub(self.filepos + 1, end_pos)
-            
         self.filepos = end_pos
         return chunk
     end
@@ -101,14 +98,13 @@ end
 local function get_page(self)
     local page = ffi.new("ogg_page")
     local result
-    
+
     repeat
         result = ogg.ogg_sync_pageout(self.sync, page)
-        
+
         if result == 0 then
-            local chunk = file_read(self, BLOCK_SIZE) --4kb per read
-            if not chunk then return nil end
-            
+            local chunk = file_read(self, BLOCK_SIZE)
+            if chunk == false then return nil end  -- EOF reached
             local buffer = ogg.ogg_sync_buffer(self.sync, #chunk)
             ffi.copy(buffer, chunk, #chunk)
             ogg.ogg_sync_wrote(self.sync, #chunk)
@@ -116,28 +112,25 @@ local function get_page(self)
             -- Not synced yet
         end
     until result == 1
-    
+
     return page
 end
 
 local function get_packet(self)
     local packet = ffi.new("ogg_packet")
     local result
-    
-    -- Initialize stream on first call
+
     if not self.stream_initialized then
         local page = get_page(self)
         if not page then return nil end
-        
         local serialno = ogg.ogg_page_serialno(page)
         ogg.ogg_stream_init(self.stream, serialno)
         self.stream_initialized = true
         ogg.ogg_stream_pagein(self.stream, page)
     end
-    
+
     repeat
         result = ogg.ogg_stream_packetout(self.stream, packet)
-        
         if result == 0 then
             local page = get_page(self)
             if not page then return nil end
@@ -146,7 +139,7 @@ local function get_packet(self)
             -- keep trying
         end
     until result == 1
-    
+
     return packet
 end
 
@@ -244,12 +237,14 @@ end
 function OpusPlayer:play()
     if self.source then
         self.source:play()
+        self.user_paused = false
     end
 end
 
 function OpusPlayer:pause()
     if self.source then
         self.source:pause()
+        self.user_paused = true
     end
 end
 
@@ -288,25 +283,37 @@ function OpusPlayer:update(packets_per_frame)
                 break 
             end
             
+            local bytes = tonumber(packet.bytes)
+            
+            if bytes == 0 then
+                self.finished = true
+                break
+            end
+            
             --5760 is max frame size for opus
             local pcm = ffi.new("short[?]", OPUS_BLOCK_SIZE * 2)
             local samples = opus.opus_decode(self.decoder, packet.packet, tonumber(packet.bytes), pcm, OPUS_BLOCK_SIZE, 0)
-            
+
             if samples > 0 then
                 local sd = love.sound.newSoundData(samples, self.samplerate, 16, self.channels)
                 for i = 0, samples * self.channels - 1 do
-                    sd:setSample(i, pcm[i] / 32768.0)
+                    sd:setSample(i, pcm[i] / bitConvert)
                 end
+
                 self.source:queue(sd)
                 self.packets_decoded = self.packets_decoded + 1
-            elseif samples < 0 then
+            elseif samples == 0 then
+                self.finished = true
+                break
+            else
                 error("Opus decode error: " .. samples)
             end
         end
 
-        if not self.source:isPlaying() and self.packets_decoded > 0 and not self.finished then
+        if not self.source:isPlaying() and self.packets_decoded > 0 and not self.finished and not self.user_paused then
             self.source:play()
         end
+
     end
 end
 
