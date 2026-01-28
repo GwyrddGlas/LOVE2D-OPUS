@@ -1,0 +1,348 @@
+local ffi = require("ffi")
+
+local OpusPlayer = {}
+OpusPlayer.__index = OpusPlayer
+
+local opus = ffi.load("opus")
+local ogg = ffi.load("ogg")
+
+local BLOCK_SIZE = 4096
+local OPUS_BLOCK_SIZE = 5760 
+
+ffi.cdef[[
+    // Opus decoder
+    typedef struct OpusDecoder OpusDecoder;
+    OpusDecoder* opus_decoder_create(int Fs, int channels, int *error);
+    void opus_decoder_destroy(OpusDecoder *st);
+    int opus_decode(OpusDecoder *st, const unsigned char *data, int len, short *pcm, int frame_size, int decode_fec);
+
+    // Ogg structures
+    typedef struct {
+        unsigned char *data;
+        long storage;
+        long fill;
+        long returned;
+        int unsynced;
+        int headerbytes;
+        int bodybytes;
+    } ogg_sync_state;
+
+    typedef struct {
+        unsigned char *header;
+        long header_len;
+        unsigned char *body;
+        long body_len;
+    } ogg_page;
+
+    typedef struct {
+        unsigned char *packet;
+        long bytes;
+        long b_o_s;
+        long e_o_s;
+        int64_t granulepos;
+        int64_t packetno;
+    } ogg_packet;
+
+    typedef struct {
+        unsigned char *body_data;
+        long body_storage;
+        long body_fill;
+        long body_returned;
+        int *lacing_vals;
+        int64_t *granule_vals;
+        long lacing_storage;
+        long lacing_fill;
+        long lacing_packet;
+        long lacing_returned;
+        unsigned char header[282];
+        int header_fill;
+        int e_o_s;
+        int b_o_s;
+        long serialno;
+        long pageno;
+        int64_t packetno;
+        int64_t granulepos;
+    } ogg_stream_state;
+
+    // Ogg functions
+    int ogg_sync_init(ogg_sync_state *oy);
+    int ogg_sync_clear(ogg_sync_state *oy);
+    char *ogg_sync_buffer(ogg_sync_state *oy, long size);
+    int ogg_sync_wrote(ogg_sync_state *oy, long bytes);
+    int ogg_sync_pageout(ogg_sync_state *oy, ogg_page *og);
+    
+    int ogg_stream_init(ogg_stream_state *os, int serialno);
+    int ogg_stream_clear(ogg_stream_state *os);
+    int ogg_stream_pagein(ogg_stream_state *os, ogg_page *og);
+    int ogg_stream_packetout(ogg_stream_state *os, ogg_packet *op);
+    
+    int ogg_page_serialno(ogg_page *og);
+    int ogg_page_bos(ogg_page *og);
+]]
+
+local function file_read(self, bytes)
+    if self.source_type == "stream" then
+        -- Stream from file handle
+        if not self.file then return nil end
+        return self.file:read(bytes)
+    else
+        -- Read from memory
+        if self.filepos >= #self.filedata then return nil end
+            
+        -- clamp the read end to the end of the file
+        local end_pos = math.min(self.filepos + bytes, #self.filedata)
+        local chunk = self.filedata:sub(self.filepos + 1, end_pos)
+            
+        self.filepos = end_pos
+        return chunk
+    end
+end
+
+local function get_page(self)
+    local page = ffi.new("ogg_page")
+    local result
+    
+    repeat
+        result = ogg.ogg_sync_pageout(self.sync, page)
+        
+        if result == 0 then
+            local chunk = file_read(self, BLOCK_SIZE) --4kb per read
+            if not chunk then return nil end
+            
+            local buffer = ogg.ogg_sync_buffer(self.sync, #chunk)
+            ffi.copy(buffer, chunk, #chunk)
+            ogg.ogg_sync_wrote(self.sync, #chunk)
+        elseif result == -1 then
+            -- Not synced yet
+        end
+    until result == 1
+    
+    return page
+end
+
+local function get_packet(self)
+    local packet = ffi.new("ogg_packet")
+    local result
+    
+    -- Initialize stream on first call
+    if not self.stream_initialized then
+        local page = get_page(self)
+        if not page then return nil end
+        
+        local serialno = ogg.ogg_page_serialno(page)
+        ogg.ogg_stream_init(self.stream, serialno)
+        self.stream_initialized = true
+        ogg.ogg_stream_pagein(self.stream, page)
+    end
+    
+    repeat
+        result = ogg.ogg_stream_packetout(self.stream, packet)
+        
+        if result == 0 then
+            local page = get_page(self)
+            if not page then return nil end
+            ogg.ogg_stream_pagein(self.stream, page)
+        elseif result == -1 then
+            -- keep trying
+        end
+    until result == 1
+    
+    return packet
+end
+
+function OpusPlayer.newSource(filename, source_type)
+    source_type = source_type or "stream"
+    
+    if source_type ~= "stream" and source_type ~= "static" then
+        error("source_type must be 'stream' or 'static'")
+    end
+    
+    local self = setmetatable({}, OpusPlayer)
+    self.source_type = source_type
+    
+    local info = love.filesystem.getInfo(filename)
+    if not info then
+        error("File not found: " .. filename)
+    end
+    
+    if source_type == "stream" then
+        -- Open file handle for streaming
+        self.file = love.filesystem.newFile(filename, "r")
+        if not self.file then
+            error("Failed to open file: " .. filename)
+        end
+        
+        -- Verify Ogg container
+        local magic = self.file:read(4)
+        if magic ~= "OggS" then
+            error("Not a valid Ogg file")
+        end
+        self.file:seek(0)
+    else
+        -- Load entire file into memory for static
+        self.filedata = love.filesystem.read(filename)
+        self.filepos = 0
+        
+        if not self.filedata then
+            error("Failed to read file: " .. filename)
+        end
+        
+        -- Verify Ogg container
+        if self.filedata:sub(1, 4) ~= "OggS" then
+            error("Not a valid Ogg file")
+        end
+    end
+    
+    -- Initialize Ogg sync/stream
+    self.sync = ffi.new("ogg_sync_state")
+    self.stream = ffi.new("ogg_stream_state")
+    self.stream_initialized = false
+    ogg.ogg_sync_init(self.sync)
+    
+    -- Skip headers
+    for i = 1, 2 do
+        local packet = get_packet(self)
+        if not packet then
+            error("Failed to read header packet " .. i)
+        end
+        
+        -- Verify first packet is OpusHead
+        if i == 1 then
+            local bytes = tonumber(packet.bytes)
+            local header = ffi.string(packet.packet, math.min(8, bytes))
+            if not header:match("OpusHead") then
+                error("Not a valid Opus file")
+            end
+        end
+    end
+    
+    -- Default to 48kHz stereo
+    local samplerate = 48000
+    local channels = 2
+    
+    -- Create Opus decoder
+    local err = ffi.new("int[1]")
+    self.decoder = opus.opus_decoder_create(samplerate, channels, err)
+    if err[0] ~= 0 then
+        error("Failed to create Opus decoder: " .. err[0])
+    end
+    
+    -- Create audio source
+    self.source = love.audio.newQueueableSource(samplerate, 16, channels)
+    self.samplerate = samplerate
+    self.channels = channels
+    self.packets_decoded = 0
+    self.finished = false
+    
+    return self
+end
+
+function OpusPlayer:getType()
+    return self.source_type
+end
+
+function OpusPlayer:play()
+    if self.source then
+        self.source:play()
+    end
+end
+
+function OpusPlayer:pause()
+    if self.source then
+        self.source:pause()
+    end
+end
+
+function OpusPlayer:stop()
+    if self.source then
+        self.source:stop()
+    end
+end
+
+function OpusPlayer:setVolume(volume)
+    if self.source then
+        self.source:setVolume(volume)
+    end
+end
+
+function OpusPlayer:getVolume()
+    return self.source and self.source:getVolume() or 1
+end
+
+function OpusPlayer:isPlaying()
+    return self.source and self.source:isPlaying()
+end
+
+function OpusPlayer:update(packets_per_frame)
+    packets_per_frame = packets_per_frame or 8
+    
+    if not self.source or self.finished then return end
+    
+    local free = self.source:getFreeBufferCount()
+    
+    if free > 0 then
+        for _ = 1, math.min(free, packets_per_frame) do
+            local packet = get_packet(self)
+            if not packet then 
+                self.finished = true
+                break 
+            end
+            
+            --5760 is max frame size for opus
+            local pcm = ffi.new("short[?]", OPUS_BLOCK_SIZE * 2)
+            local samples = opus.opus_decode(self.decoder, packet.packet, tonumber(packet.bytes), pcm, OPUS_BLOCK_SIZE, 0)
+            
+            if samples > 0 then
+                local sd = love.sound.newSoundData(samples, self.samplerate, 16, self.channels)
+                for i = 0, samples * self.channels - 1 do
+                    sd:setSample(i, pcm[i] / 32768.0)
+                end
+                self.source:queue(sd)
+                self.packets_decoded = self.packets_decoded + 1
+            elseif samples < 0 then
+                error("Opus decode error: " .. samples)
+            end
+        end
+
+        if not self.source:isPlaying() and self.packets_decoded > 0 and not self.finished then
+            self.source:play()
+        end
+    end
+end
+
+function OpusPlayer:getStats()
+    return {
+        packets_decoded = self.packets_decoded,
+        free_buffers = self.source and self.source:getFreeBufferCount() or 0,
+        is_playing = self:isPlaying(),
+        finished = self.finished,
+        source_type = self.source_type
+    }
+end
+
+function OpusPlayer:destroy()
+    if self.decoder then 
+        opus.opus_decoder_destroy(self.decoder)
+        self.decoder = nil
+    end
+    if self.stream and self.stream_initialized then 
+        ogg.ogg_stream_clear(self.stream)
+        self.stream = nil
+    end
+    if self.sync then 
+        ogg.ogg_sync_clear(self.sync)
+        self.sync = nil
+    end
+    if self.source then
+        self.source:stop()
+        self.source = nil
+    end
+    if self.file then
+        self.file:close()
+        self.file = nil
+    end
+
+    self.filedata = nil
+end
+
+return OpusPlayer
