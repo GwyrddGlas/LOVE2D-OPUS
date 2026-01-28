@@ -79,6 +79,7 @@ ffi.cdef[[
     
     int ogg_page_serialno(ogg_page *og);
     int ogg_page_bos(ogg_page *og);
+    int ogg_page_eos(ogg_page *og);
 ]]
 
 local function file_read(self, bytes)
@@ -143,6 +144,57 @@ local function get_packet(self)
     return packet
 end
 
+--i really dont like this but im not sure of another way atm
+local function compute_duration(self)
+    local temp = {
+        filedata = self.filedata,
+        filepos = 0,
+        source_type = "static"
+    }
+
+    local last_granule = 0
+    local sync = ffi.new("ogg_sync_state")
+    local stream = ffi.new("ogg_stream_state")
+    local stream_initialized = false
+    
+    ogg.ogg_sync_init(sync)
+
+    while true do
+        local chunk = file_read(temp, 4096)
+        if chunk == false then break end
+
+        local buffer = ogg.ogg_sync_buffer(sync, #chunk)
+        ffi.copy(buffer, chunk, #chunk)
+        ogg.ogg_sync_wrote(sync, #chunk)
+
+        local page = ffi.new("ogg_page")
+        while ogg.ogg_sync_pageout(sync, page) == 1 do
+            if not stream_initialized then
+                local serialno = ogg.ogg_page_serialno(page)
+                ogg.ogg_stream_init(stream, serialno)
+                stream_initialized = true
+            end
+
+            ogg.ogg_stream_pagein(stream, page)
+
+            local packet = ffi.new("ogg_packet")
+            while ogg.ogg_stream_packetout(stream, packet) == 1 do
+                if tonumber(packet.granulepos) > 0 then
+                    last_granule = tonumber(packet.granulepos)
+                end
+            end
+        end
+    end
+
+    -- Clean up
+    if stream_initialized then
+        ogg.ogg_stream_clear(stream)
+    end
+    ogg.ogg_sync_clear(sync)
+
+    self.duration_samples = last_granule
+end
+
 function OpusPlayer.newSource(filename, source_type)
     source_type = source_type or "stream"
     
@@ -184,6 +236,8 @@ function OpusPlayer.newSource(filename, source_type)
         if self.filedata:sub(1, 4) ~= "OggS" then
             error("Not a valid Ogg file")
         end
+
+        compute_duration(self)
     end
     
     -- Initialize Ogg sync/stream
@@ -224,6 +278,15 @@ function OpusPlayer.newSource(filename, source_type)
     self.source = love.audio.newQueueableSource(samplerate, 16, channels)
     self.samplerate = samplerate
     self.channels = channels
+
+    self.decoded_samples = 0   
+    self.played_samples = 0    
+
+    self.queued_samples = 0    
+    self.buffer_samples = {}
+    self.user_paused = false
+    self.duration_samples = nil
+
     self.packets_decoded = 0
     self.finished = false
     
@@ -235,17 +298,15 @@ function OpusPlayer:getType()
 end
 
 function OpusPlayer:play()
-    if self.source then
-        self.source:play()
-        self.user_paused = false
-    end
+    if self.source and not self.user_paused then return end
+    self.user_paused = false
+    self.source:play()
 end
 
 function OpusPlayer:pause()
-    if self.source then
-        self.source:pause()
-        self.user_paused = true
-    end
+    if not self.source or self.user_paused then return end
+    self.user_paused = true
+    self.source:pause()
 end
 
 function OpusPlayer:stop()
@@ -268,6 +329,23 @@ function OpusPlayer:isPlaying()
     return self.source and self.source:isPlaying()
 end
 
+function OpusPlayer:getDuration()
+    if not self.duration_samples then
+        compute_duration(self)
+    end
+
+    return self.duration_samples / self.samplerate
+end
+
+function OpusPlayer:tell()
+    if not self.source then return 0 end
+    
+    -- Current position = total decoded - what's still in the queue
+    local current_samples = self.decoded_samples - self.queued_samples
+    
+    return current_samples / self.samplerate
+end
+
 function OpusPlayer:update(packets_per_frame)
     packets_per_frame = packets_per_frame or 8
     
@@ -275,6 +353,23 @@ function OpusPlayer:update(packets_per_frame)
     
     local free = self.source:getFreeBufferCount()
     
+    -- Calculate how many buffers were consumed since last update
+    if self.last_free_buffers then
+        local buffers_consumed = free - self.last_free_buffers
+        
+        -- Remove consumed buffers from tracking
+        for i = 1, buffers_consumed do
+            local samples = table.remove(self.buffer_samples, 1)
+            if samples then
+                self.played_samples = self.played_samples + samples
+            end
+        end
+    end
+    
+    -- Store current free count BEFORE queuing new buffers
+    local free_before_queue = free
+    
+    -- Queue new buffers
     if free > 0 then
         for _ = 1, math.min(free, packets_per_frame) do
             local packet = get_packet(self)
@@ -290,18 +385,22 @@ function OpusPlayer:update(packets_per_frame)
                 break
             end
             
-            --5760 is max frame size for opus
             local pcm = ffi.new("short[?]", OPUS_BLOCK_SIZE * 2)
             local samples = opus.opus_decode(self.decoder, packet.packet, tonumber(packet.bytes), pcm, OPUS_BLOCK_SIZE, 0)
 
             if samples > 0 then
                 local sd = love.sound.newSoundData(samples, self.samplerate, 16, self.channels)
+                
                 for i = 0, samples * self.channels - 1 do
                     sd:setSample(i, pcm[i] / bitConvert)
                 end
 
                 self.source:queue(sd)
+                table.insert(self.buffer_samples, samples)
+
+                self.decoded_samples = self.decoded_samples + samples
                 self.packets_decoded = self.packets_decoded + 1
+
             elseif samples == 0 then
                 self.finished = true
                 break
@@ -313,8 +412,16 @@ function OpusPlayer:update(packets_per_frame)
         if not self.source:isPlaying() and self.packets_decoded > 0 and not self.finished and not self.user_paused then
             self.source:play()
         end
-
     end
+    
+    -- Recalculate queued_samples from buffer_samples array
+    self.queued_samples = 0
+    for _, samples in ipairs(self.buffer_samples) do
+        self.queued_samples = self.queued_samples + samples
+    end
+    
+    -- Store free count AFTER queuing for next frame
+    self.last_free_buffers = self.source:getFreeBufferCount()
 end
 
 function OpusPlayer:getStats()
